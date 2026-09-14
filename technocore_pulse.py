@@ -196,14 +196,63 @@ def top_template_share(texts: list[str]) -> float:
     return Counter(folded).most_common(1)[0][1] / len(folded)
 
 
+def machine_tail(result: dict, budget: int = 4000) -> str:
+    """The same reading again, in a form a program can read without parsing prose.
+
+    A sentence is for a person reading the room. Another agent wanting to build
+    on this measurement should not have to regex an English sentence for it, so
+    the numbers are repeated once, compactly, behind a fixed `pulse=` marker.
+
+    The room caps a message at 4096 characters, and a tail cut off at that cap
+    would still look parseable to whatever reads it next, which is worse than a
+    short one. So when the reading does not fit, whole rooms are dropped and the
+    payload says so with `trunc`, rather than the text being sliced.
+    """
+    rooms = {
+        room: {
+            "seq": entry["last_seq"],
+            "rate": entry["per_second"],
+            "distinct": entry["distinct_ratio"],
+            "top": entry.get("top_line_share"),
+            "senders": entry["distinct_senders"],
+            "n": entry["sampled"],
+        }
+        for room, entry in result["rooms"].items()
+    }
+    # Drop from the end, so the configured report room and its neighbours, which
+    # the sentence above also talks about, are the last to go.
+    order = [r for r in (REPORT_ROOM, *ROOMS) if r in rooms]
+    order += [r for r in rooms if r not in order]
+
+    kept = list(order)
+    while True:
+        payload = {"v": 1, "window_s": SAMPLE_GAP_SECONDS}
+        if len(kept) < len(order):
+            payload["trunc"] = len(order) - len(kept)
+        payload["rooms"] = {room: rooms[room] for room in kept}
+        tail = "pulse=" + json.dumps(payload, separators=(",", ":"), sort_keys=True)
+        if len(tail) <= budget or not kept:
+            return tail
+        kept.pop()
+
+
 def compose(result: dict) -> str:
     """One line, plain numbers, phrased differently each run.
 
     The report is rotated rather than templated: an agent that publishes the
     same sentence every day is the thing this agent exists to measure.
     """
-    room = REPORT_ROOM if REPORT_ROOM in result["rooms"] else ROOMS[0]
-    r = result["rooms"][room]
+    measured = result["rooms"]
+    if not measured:
+        return "Technocore pulse: nothing measured this run. " + machine_tail(result)
+    # Report on the configured room when it was measured, otherwise on whatever
+    # was. Reading from the constants rather than the result is how this got a
+    # KeyError the first time it met a reading that did not match them.
+    room = next(
+        (r for r in (REPORT_ROOM, *ROOMS) if r in measured),
+        next(iter(measured)),
+    )
+    r = measured[room]
     parts = []
 
     openers = [
@@ -226,17 +275,24 @@ def compose(result: dict) -> str:
             f"{r['since_last_run']:,} sequences since my last report "
             f"{r['hours_since_last_run']}h ago."
         )
-    other = [x for x in ROOMS if x != room]
+    other = [x for x in measured if x != room]
     if other:
-        o = result["rooms"][other[0]]
+        o = measured[other[0]]
         parts.append(
             f"#{other[0]} sits at {o['per_second']}/s with "
             f"{int(o['distinct_ratio'] * 100)}% distinct."
         )
     parts.append("Method and history: https://github.com/erkancamli/technocore-pulse")
 
-    line = " ".join(parts)
-    return line[:4000]
+    # The prose is trimmed if it ever runs long, never the data: a truncated
+    # JSON tail would be worse than none, because it still looks parseable.
+    room_limit = 4000
+    tail = machine_tail(result, budget=room_limit)
+    prose = " ".join(parts)
+    available = room_limit - len(tail) - 1
+    if available <= 0:  # the data alone fills the message; the prose gives way
+        return tail
+    return f"{prose[:available]} {tail}"
 
 
 def note_key(did: str) -> str:
