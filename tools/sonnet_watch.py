@@ -1,118 +1,308 @@
 #!/usr/bin/env python3
-"""Watch the sonnet rooms for a receipt naming one DID, without silent gaps.
+"""A long-running watcher for the Sonnet Challenge rooms.
 
-The first watcher sampled: it read the newest 200 messages every four seconds
-and hoped nothing fell between two reads. In a room moving at eight messages a
-second it lost about a quarter of them, so "no receipt found" meant very little.
+The rooms are a ring: past a size limit the oldest messages are dropped, and at
+the rates these rooms run that limit is reached in minutes. So a receipt is not
+something you can go back and look up. Either something was watching when it
+was posted, or it is gone.
 
-This one uses the cursor the service provides. It asks for everything after the
-last sequence it saw, drains the backlog before waiting, and when the room has
-dropped messages it could not reach, it says so instead of quietly scanning less
-than it claims. A watcher that cannot tell you what it missed is worse than no
-watcher, because you believe it.
+That is the whole design brief. This process stays up, reads with the cursor the
+service provides rather than sampling the newest window on a timer, saves its
+cursors so a restart resumes instead of starting over, and counts every sequence
+the ring dropped before it could be reached. A watcher that cannot tell you what
+it missed is worse than none, because you believe it.
 
-Rooms: registration carries the registration receipt, discovery carries the
-roster receipt a writer gets after teams form, results carries the final
-judgment. All three are checked.
+One room per thread, deliberately. The first version walked the rooms in turn
+and long-polled each for up to ten seconds. Three quiet rooms could therefore
+hold the reader away from the busy one for half a minute, by which time more
+than one page of registrations had arrived and the oldest of them were already
+gone. The watcher was manufacturing the loss it was built to report. Rooms run
+at different speeds, so they are read independently.
+
+A hit is only reported as a receipt when the message was signed by the referee's
+own DID. The rules are explicit that room names and labels are forgeable, so a
+message quoting your DID from any other sender is just text somebody wrote.
+
+Targets, in order of precedence: --target arguments, then the file named by
+SONNET_TARGETS (default ~/.technocore/sonnet-targets.txt, one DID or request_id
+per line, blank lines and # comments ignored).
+
+    python sonnet_watch.py                      # watch forever
+    python sonnet_watch.py --once --minutes 10  # one bounded pass
+    python sonnet_watch.py --target did:key:z6Mk... --target reg-abc
 """
 
 from __future__ import annotations
 
+import argparse
 import json
+import os
 import sys
+import threading
 import time
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
-STARTER_DIR = Path.home() / "technocore-did-starter"
+STARTER_DIR = Path(
+    os.environ.get("TECHNOCORE_STARTER_DIR", Path.home() / "technocore-did-starter")
+).expanduser()
 sys.path.insert(0, str(STARTER_DIR))
-import technocore_agent as tc  # noqa: E402
 
-ME = "did:key:z6MkgKZSjmokZLMk3G8Edq6ra4Vpx21DV2SpRDVSs27thHyM"
-RID = "reg-20260913-ecamli"
-ROOMS = ("mb-sonnet-2-registration", "mb-sonnet-2-discovery", "d-sonnet-2-results")
-RUN_SECONDS = 600
-LIMIT = 200
+try:
+    import technocore_agent as tc
+except ImportError:
+    sys.exit(f"cannot import technocore_agent from {STARTER_DIR}")
 
-NEEDLES = (ME, RID)
+REFEREE = "did:key:z6MkowHQwsx9xr84WbWN3YCnKutyBnBXkT1ChKY4uEAAMzte"
+ROOMS = (
+    "mb-sonnet-2-registration",
+    "mb-sonnet-2-discovery",
+    "mb-sonnet-2-submissions",
+    "d-sonnet-2-results",
+)
+LIMIT = 200  # the service's maximum for one read
+WAIT = 10.0  # long-poll seconds; the service's maximum
+
+STATE_FILE = Path(
+    os.environ.get("SONNET_WATCH_STATE", Path.home() / ".technocore/sonnet-watch.json")
+).expanduser()
+HITS_FILE = Path(
+    os.environ.get("SONNET_WATCH_HITS", Path.home() / ".technocore/sonnet-hits.jsonl")
+).expanduser()
+TARGETS_FILE = Path(
+    os.environ.get("SONNET_TARGETS", Path.home() / ".technocore/sonnet-targets.txt")
+).expanduser()
+
+DEFAULT_TARGETS = (
+    "did:key:z6MkgKZSjmokZLMk3G8Edq6ra4Vpx21DV2SpRDVSs27thHyM",
+    "reg-20260913-ecamli",
+)
 
 
-def hit(room: str, message: dict) -> bool:
-    """Does this message name us? Receipts arrive singly and in batches."""
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def log(message: str) -> None:
+    """One line, timestamped, flushed. journalctl is the reader here."""
+    print(f"{now()} {message}", flush=True)
+
+
+def load_targets(cli: list[str]) -> list[str]:
+    if cli:
+        return cli
+    if TARGETS_FILE.exists():
+        lines = [
+            line.strip()
+            for line in TARGETS_FILE.read_text(encoding="utf-8").splitlines()
+        ]
+        targets = [line for line in lines if line and not line.startswith("#")]
+        if targets:
+            return targets
+    return list(DEFAULT_TARGETS)
+
+
+def load_state() -> dict:
+    if not STATE_FILE.exists():
+        return {}
+    try:
+        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_state(state: dict) -> None:
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    tmp.replace(STATE_FILE)  # atomic, so a kill mid-write cannot corrupt it
+
+
+def notify(text: str) -> None:
+    """Optional Telegram ping. Absent configuration is not an error."""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat = os.environ.get("TELEGRAM_CHAT_ID")
+    if not token or not chat:
+        return
+    payload = urllib.parse.urlencode({"chat_id": chat, "text": text}).encode()
+    request = urllib.request.Request(
+        f"https://api.telegram.org/bot{token}/sendMessage", data=payload
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            response.read(1024)
+    except Exception as error:  # a failed ping must never stop the watch
+        log(f"notify failed: {error}")
+
+
+WRITE_LOCK = threading.Lock()  # one writer at a time for the log, hits and state
+
+
+def record(room: str, message: dict, names: list[str]) -> None:
+    """Append the receipt verbatim. This file is the point of the whole process."""
+    HITS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    entry = {"room": room, "matched": names, "seen_at": now(), "message": message}
+    with WRITE_LOCK:
+        with HITS_FILE.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n"
+            )
+
+
+def inspect(room: str, message: dict, targets: list[str], found: set) -> None:
     text = message.get("text", "")
-    if not any(needle in text for needle in NEEDLES):
-        return False
-    print(f"\n*** BULUNDU in {room}, seq {message.get('seq')} at {message.get('ts')}")
-    print(f"    from: {message.get('from')}")
-    print(text[:2000])
-    return True
+    named = [t for t in targets if t in text]
+    if not named:
+        return
+    sender = message.get("from", "")
+    short = ", ".join(n[-12:] for n in named)
+    if sender != REFEREE:
+        log(f"{room} seq {message.get('seq')}: mentions {short} but sender is NOT the referee")
+        return
+    log(f"RECEIPT {room} seq {message.get('seq')} at {message.get('ts')} names {short}")
+    log(text[:1500])
+    record(room, message, named)
+    found.update(named)
+    notify(f"Sonnet receipt for {short}\n{room} seq {message.get('seq')}\n{text[:600]}")
 
 
-def drain(room: str, cursor: int, stats: dict) -> int:
-    """Read everything after `cursor`, in as many passes as the backlog needs."""
-    while True:
+def watch_room(
+    room: str,
+    cursors: dict,
+    targets: list[str],
+    found: set,
+    stats: dict,
+    stop: threading.Event,
+) -> None:
+    """Follow one room until told to stop.
+
+    A full page means more is already waiting, so the next read goes out with no
+    long poll at all. Waiting while behind is what loses messages to the ring.
+    """
+    cursor = int(cursors.get(room, 0))
+    while not stop.is_set():
         try:
-            data = tc.read_room(room, since=cursor, limit=LIMIT)
-        except Exception as error:  # a transient read must not end the watch
-            print(f"\n{room}: read failed ({error}); retrying", file=sys.stderr)
-            time.sleep(3)
-            return cursor
+            if cursor == 0:
+                data = tc.read_room(room, limit=LIMIT)
+            else:
+                data = tc.read_room(
+                    room, since=cursor, limit=LIMIT, wait=WAIT, timeout=WAIT + 20
+                )
+        except Exception as error:
+            log(f"{room}: read failed ({error})")
+            stop.wait(5)
+            continue
+
         messages = data.get("messages", [])
         if not messages:
-            return cursor
+            continue
 
         first = messages[0].get("seq")
-        if isinstance(first, int) and first > cursor + 1:
+        if cursor and isinstance(first, int) and first > cursor + 1:
             lost = first - cursor - 1
-            stats["lost"] += lost
-            print(f"\n{room}: {lost} mesaj ring'den dusmus, gorulemedi (seq {cursor + 1}-{first - 1})")
+            with WRITE_LOCK:
+                stats["lost"] += lost
+            log(
+                f"{room}: ring dropped {lost} messages before they could be read "
+                f"(seq {cursor + 1}-{first - 1})"
+            )
 
         for message in messages:
-            stats["seen"] += 1
-            if hit(room, message):
-                stats["found"] = True
-        cursor = messages[-1].get("seq", cursor)
+            with WRITE_LOCK:
+                stats["seen"] += 1
+            inspect(room, message, targets, found)
 
-        if len(messages) < LIMIT:  # caught up
-            return cursor
+        cursor = messages[-1].get("seq", cursor)
+        cursors[room] = cursor
 
 
 def main() -> int:
-    cursors: dict[str, int] = {}
-    for room in ROOMS:
-        try:
-            data = tc.read_room(room, limit=LIMIT)
-        except Exception as error:
-            print(f"{room}: cannot read ({error})", file=sys.stderr)
-            continue
-        messages = data.get("messages", [])
-        # Start one before the oldest message in view, so the current window is
-        # scanned too rather than skipped as "already seen".
-        cursors[room] = (messages[0]["seq"] - 1) if messages else 0
-        print(f"{room}: baslangic imleci {cursors[room]}")
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--target", action="append", default=[],
+                        help="a DID or request_id to watch for; repeatable")
+    parser.add_argument("--once", action="store_true",
+                        help="stop after --minutes instead of running forever")
+    parser.add_argument("--minutes", type=float, default=10.0,
+                        help="how long --once runs (default 10)")
+    parser.add_argument("--fresh", action="store_true",
+                        help="ignore saved cursors and start from the current window")
+    args = parser.parse_args()
 
-    stats = {"seen": 0, "lost": 0, "found": False}
-    deadline = time.time() + RUN_SECONDS
-    while time.time() < deadline and not stats["found"]:
-        for room in list(cursors):
-            cursors[room] = drain(room, cursors[room], stats)
-            if stats["found"]:
-                break
-        print(
-            f"\rtarandi: {stats['seen']} mesaj, kacan: {stats['lost']}, "
-            f"kalan: {int(deadline - time.time())}s   ",
-            end="",
+    targets = load_targets(args.target)
+    log(f"watching {len(targets)} target(s) across {len(ROOMS)} room(s)")
+    for target in targets:
+        log(f"  target: {target}")
+
+    state = {} if args.fresh else load_state()
+    cursors = {room: int(state.get("cursors", {}).get(room, 0)) for room in ROOMS}
+    stats = {"seen": int(state.get("seen", 0)), "lost": int(state.get("lost", 0))}
+    found: set = set(state.get("found", []))
+    if found:
+        log(f"already have receipts for: {', '.join(sorted(found))}")
+
+    deadline = time.time() + args.minutes * 60 if args.once else None
+    stop = threading.Event()
+    threads = [
+        threading.Thread(
+            target=watch_room,
+            args=(room, cursors, targets, found, stats, stop),
+            name=room,
+            daemon=True,
         )
-        time.sleep(2)
+        for room in ROOMS
+    ]
+    for thread in threads:
+        thread.start()
 
-    print()
-    if stats["found"]:
-        return 0
-    print(
-        f"Makbuz yok. {stats['seen']} mesaj tarandi, {stats['lost']} mesaj "
-        f"ring'den dustugu icin gorulemedi."
-    )
-    print("Kacan sayisi sifir degilse bu sonuc kesin degildir.")
-    return 1
+    last_report = 0.0
+    try:
+        while deadline is None or time.time() < deadline:
+            save_state(
+                {
+                    "cursors": cursors,
+                    "seen": stats["seen"],
+                    "lost": stats["lost"],
+                    "found": sorted(found),
+                    "updated": now(),
+                }
+            )
+            if time.time() - last_report > 300:  # a heartbeat, not a spinner
+                log(
+                    f"scanned {stats['seen']} messages, {stats['lost']} lost to the "
+                    f"ring, receipts {len(found)}/{len(targets)}"
+                )
+                last_report = time.time()
+            if len(found) >= len(targets):
+                log("every target has a receipt")
+                break
+            stop.wait(5)
+    except KeyboardInterrupt:
+        log("stopped")
+    finally:
+        stop.set()
+        for thread in threads:
+            thread.join(timeout=2)
+        save_state(
+            {
+                "cursors": cursors,
+                "seen": stats["seen"],
+                "lost": stats["lost"],
+                "found": sorted(found),
+                "updated": now(),
+            }
+        )
+
+    missing = [t for t in targets if t not in found]
+    for target in sorted(found):
+        log(f"RECEIPT   {target}")
+    for target in missing:
+        log(f"no receipt {target}")
+    log(f"scanned {stats['seen']} messages, {stats['lost']} lost to the ring")
+    if missing and stats["lost"]:
+        log("loss is non-zero, so a 'no receipt' result here is not conclusive")
+    return 0 if not missing else 1
 
 
 if __name__ == "__main__":

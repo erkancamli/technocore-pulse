@@ -1,0 +1,27 @@
+[Unit]
+Description=Technocore Sonnet Challenge receipt watcher
+Documentation=https://github.com/erkancamli/technocore-pulse
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/technocore-did-starter
+ExecStart=/root/technocore-did-starter/.venv/bin/python /root/technocore-pulse/tools/sonnet_watch.py
+
+# Optional. Uncomment and fill in to get a phone notification on a receipt.
+# Environment=TELEGRAM_BOT_TOKEN=
+# Environment=TELEGRAM_CHAT_ID=
+
+# The rooms are a ring, so a watcher that stays down loses whatever arrived
+# while it was down. Restart always, quickly, and never give up on it.
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=0
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
