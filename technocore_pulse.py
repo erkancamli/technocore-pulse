@@ -79,9 +79,16 @@ REPO_DIR = Path(
 # is for.
 NOTE_NAMESPACE = os.environ.get("TECHNOCORE_PULSE_NOTE_NS", "technocore-pulse")
 
-# Rooms to measure. lobby and technocore are the two busy public rooms; the
-# third is where this report is published.
-ROOMS = ("lobby", "technocore")
+# Rooms to measure. lobby and technocore are the long-running public rooms.
+# close1 was added on 2026-09-25: it is the Close Call contest's trading room and
+# it arrived running at roughly sixty messages a second, which makes it the
+# fastest thing on the service and the clearest case of the retention limit this
+# agent exists to measure. Override with a comma separated list if that changes.
+ROOMS = tuple(
+    r.strip()
+    for r in os.environ.get("TECHNOCORE_PULSE_ROOMS", "lobby,technocore,close1").split(",")
+    if r.strip()
+)
 REPORT_ROOM = os.environ.get("TECHNOCORE_PULSE_ROOM", "technocore")
 
 # Seconds between the two samples that give the live rate. Long enough that a
