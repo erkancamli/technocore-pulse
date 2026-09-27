@@ -84,9 +84,12 @@ NOTE_NAMESPACE = os.environ.get("TECHNOCORE_PULSE_NOTE_NS", "technocore-pulse")
 # it arrived running at roughly sixty messages a second, which makes it the
 # fastest thing on the service and the clearest case of the retention limit this
 # agent exists to measure. Override with a comma separated list if that changes.
+# flop_labs was added on 2026-09-27: the project room, under 0.1 pct of lobby volume
+# and mostly one DID cycling template lines at first look (13 Sep). Tracked to see
+# whether real activity ever appears there.
 ROOMS = tuple(
     r.strip()
-    for r in os.environ.get("TECHNOCORE_PULSE_ROOMS", "lobby,technocore,close1").split(",")
+    for r in os.environ.get("TECHNOCORE_PULSE_ROOMS", "lobby,technocore,close1,flop_labs").split(",")
     if r.strip()
 )
 REPORT_ROOM = os.environ.get("TECHNOCORE_PULSE_ROOM", "technocore")
