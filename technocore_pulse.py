@@ -96,7 +96,19 @@ ROOMS = tuple(
 # Trailing tags template posters append to dodge exact-match counting, seen
 # 8 to 15 Oct: " · 77rh4", "·805", "[step #35589-cj3]", "[tx #98487-e33]",
 # "[sync #63355-xrs]", "◆8056", "•1510". Stripped before folding.
-SUFFIX_RE = re.compile(r"(?:\s*[·◆•]\s*[a-z0-9]{1,8}|\s*\[[a-z]+ #[a-z0-9-]+\])+\s*$")
+# Template posters append a throwaway suffix so their identical sentence is a
+# different string. Four forms have appeared so far and each was added after it
+# was seen, which is the problem with the approach rather than with the list.
+SUFFIX_RE = re.compile(
+    r"(?:\s*[·◆•†‡§※★☆]\s*[a-z0-9]{1,8}"
+    r"|\s*\[[a-z]+ #[a-z0-9-]+\])+\s*$"
+)
+
+# What a suffix that the rule does not know yet looks like: some symbol this
+# sentence would not normally end on, followed by a short run of characters.
+# Counting these turns the next surprise into a number in the report instead of
+# a silent lift in the distinct ratio.
+RESIDUE_RE = re.compile(r"[^\w\s.,!?;:'\"()\[\]/<>@-][a-z0-9]{1,8}$")
 
 REPORT_ROOM = os.environ.get("TECHNOCORE_PULSE_ROOM", "technocore")
 
@@ -143,6 +155,28 @@ def sample(room: str) -> dict:
     }
 
 
+def fold(text: str) -> str:
+    """One line reduced to the form two identical sentences share.
+
+    Lowercased, whitespace collapsed, and any known template suffix removed.
+    This is the agent's definition of "the same line" and everything that
+    counts repetition goes through it, so there is one rule rather than
+    several that drift.
+    """
+    return " ".join(SUFFIX_RE.sub("", text.strip().lower()).split())
+
+
+def suffix_residue(texts: list[str]) -> int:
+    """Lines that still look suffixed after the rule has had its turn.
+
+    A positive count means a new suffix form is in circulation and the
+    distinct ratio for this sample is too high by roughly that many lines.
+    Publishing the count is more honest than publishing a ratio that quietly
+    assumes the rule is complete.
+    """
+    return sum(1 for text in texts if RESIDUE_RE.search(fold(text)))
+
+
 def distinct_ratio(texts: list[str]) -> float:
     """Share of a sample that is not a repeat of another line in that sample.
 
@@ -152,10 +186,7 @@ def distinct_ratio(texts: list[str]) -> float:
     """
     if not texts:
         return 0.0
-    folded = []
-    for text in texts:
-        core = SUFFIX_RE.sub("", text.strip().lower())
-        folded.append(" ".join(core.split()))
+    folded = [fold(text) for text in texts]
     return len(set(folded)) / len(folded)
 
 
@@ -185,6 +216,7 @@ def measure() -> dict:
             "per_day_projected": int(per_second * 86400),
             "distinct_ratio": round(distinct_ratio(texts), 3),
             "top_line_share": round(top_template_share(texts), 3),
+            "suffix_residue": suffix_residue(texts),
             "distinct_senders": len(set(a["senders"] + b["senders"])),
             "sampled": len(texts),
         }
@@ -230,6 +262,7 @@ def machine_tail(result: dict, budget: int = 4000) -> str:
             "top": entry.get("top_line_share"),
             "senders": entry["distinct_senders"],
             "n": entry["sampled"],
+            "resid": entry.get("suffix_residue", 0),
         }
         for room, entry in result["rooms"].items()
     }
