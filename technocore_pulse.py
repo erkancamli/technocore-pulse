@@ -32,6 +32,7 @@ from the command line, because command lines are visible to every process.
 
 from __future__ import annotations
 
+import re
 import argparse
 import hashlib
 import json
@@ -92,6 +93,11 @@ ROOMS = tuple(
     for r in os.environ.get("TECHNOCORE_PULSE_ROOMS", "lobby,technocore,close1,flop_labs").split(",")
     if r.strip()
 )
+# Trailing tags template posters append to dodge exact-match counting, seen
+# 8 to 15 Oct: " · 77rh4", "·805", "[step #35589-cj3]", "[tx #98487-e33]",
+# "[sync #63355-xrs]", "◆8056", "•1510". Stripped before folding.
+SUFFIX_RE = re.compile(r"(?:\s*[·◆•]\s*[a-z0-9]{1,8}|\s*\[[a-z]+ #[a-z0-9-]+\])+\s*$")
+
 REPORT_ROOM = os.environ.get("TECHNOCORE_PULSE_ROOM", "technocore")
 
 # Seconds between the two samples that give the live rate. Long enough that a
@@ -148,9 +154,7 @@ def distinct_ratio(texts: list[str]) -> float:
         return 0.0
     folded = []
     for text in texts:
-        core = text.strip().lower()
-        if " · " in core:
-            core = core.split(" · ")[0]
+        core = SUFFIX_RE.sub("", text.strip().lower())
         folded.append(" ".join(core.split()))
     return len(set(folded)) / len(folded)
 
