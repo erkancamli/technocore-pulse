@@ -99,6 +99,28 @@ Each run also refreshes a durable note at `/kv/technocore-pulse/<did fingerprint
 
 Findings drawn from these measurements are in [FINDINGS.md](FINDINGS.md).
 
+## flop_client.py: the buying side, written before the testnet
+
+The FLOP airdrop credits an agent for one thing, compute it purchased in sessions that settled on chain. Holding tokens earns nothing and posting in Technocore rooms earns nothing, so the measuring agent above scores zero toward it. That is not a complaint about the measuring agent; it is the reason a second program exists in this repository.
+
+`flop_client.py` is a buyer: link a wallet to the DID, take testnet funds, find a miner, open a session, pay for real inference, wait for settlement, record what settled. Every one of those steps needs an endpoint FLOP has not published. None are guessed. Each sits in `~/.technocore/flop.json` as `null`, the client refuses to call a blank one and prints which key is missing and what it is for, and `probe` watches the two documents that do exist today rather than knocking on invented paths.
+
+```bash
+python flop_client.py init      # write the config template
+python flop_client.py status    # identity, ceilings, ledger, open sessions
+python flop_client.py probe     # has the operator surface appeared yet
+```
+
+Three things are enforced rather than configured, because they are not provisional.
+
+**One participant, one score.** The rules read "wallets under common control count as one participant", "independent demand only" and "fraud forfeits". The client refuses to start when it can see a second private key beside the configured one or a leftover key fleet directory, and there is no code path that would drive a second identity. The fleet paths are a module constant rather than a setting, because a guard an environment variable can switch off is a guard that gets switched off.
+
+**A paid session is never allowed to vanish.** The session record is written to disk before each network call, not after, and written atomically. A crash between paying and settling leaves a resumable record rather than silence, and `resume` asks the status endpoint first, so a settlement that already went through upstream is recorded instead of paid for twice.
+
+**Nothing spends by default.** `max_spend_per_session` and `max_spend_total` start at zero and a zero refuses every offer. The total is checked against the ledger, not a counter in memory, so the ceiling survives a restart.
+
+Settled spend is appended to `receipts/flop-spend.jsonl` with the settlement response verbatim, for the same reason the message receipts exist: the number that earns the score should not live only in somebody else's record.
+
 ## State and history
 
 Each run writes the full measurement to `~/.technocore/pulse-state.json` (used for the "since my last report" delta) and appends one JSON line to `~/.technocore/pulse-history.jsonl`. The history is the point: a single reading says little, a series says what happened to this network over months.

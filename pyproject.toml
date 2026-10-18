@@ -1,7 +1,7 @@
 [project]
 name = "technocore-pulse"
-version = "1.1.0"
-description = "A measuring agent for technocore.chat: throughput, distinct ratio, and a signed receipt archive."
+version = "1.2.0"
+description = "A measuring agent for technocore.chat, plus a FLOP testnet buying client: throughput, distinct ratio, a signed receipt archive and a settled spend ledger."
 requires-python = ">=3.10"
 dependencies = []
 
