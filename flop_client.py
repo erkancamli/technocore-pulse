@@ -519,14 +519,27 @@ def cmd_status(args) -> int:
 
 
 def cmd_probe(args) -> int:
-    """Check whether the operator surface has appeared, without guessing paths."""
-    transport = Transport()
-    for url in DISCOVERY:
-        try:
-            transport.call("GET", url)
-            print(f"{url}  reachable")
-        except RuntimeError as error:
-            print(f"{url}  {error}")
+    """Check whether the operator surface has appeared, without guessing paths.
+
+    The page reading itself lives in flop_watch, so there is one definition of
+    "still closed" rather than two that disagree on the morning it matters.
+    """
+    try:
+        import flop_watch
+
+        report = flop_watch.run()
+        print(f"{report['still_closed']} of {report['read']} page(s) read still "
+              f"say nothing is available")
+        for line in flop_watch.lines(report):
+            print(line)
+    except ImportError:
+        transport = Transport()
+        for url in DISCOVERY:
+            try:
+                transport.call("GET", url)
+                print(f"{url}  reachable")
+            except RuntimeError as error:
+                print(f"{url}  {error}")
     config = load_config()
     missing = [k for k, v in (config.get("endpoints") or {}).items() if not v]
     if missing:
