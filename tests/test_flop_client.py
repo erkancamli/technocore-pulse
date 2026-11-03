@@ -1,8 +1,12 @@
 """Tests for the FLOP buying client.
 
-No network and no identity. The transport is replaced wholesale, which is the
-reason it exists as one class, and every path that could spend money is
+No network, no chain, no keystore. The CLI is replaced by a scripted stand in,
+which is why it exists as one class, and every path that could spend is
 exercised against it.
+
+The model name case is not invented. The byte sequence in CORRUPTED_NAME is
+what @flop-labs/cli 0.4.0 printed for the devnet model whose real name is
+Qwen/Qwen3-8B on 3 November 2026.
 """
 
 from __future__ import annotations
@@ -16,53 +20,94 @@ import pytest
 import flop_client as fc
 
 
-class FakeTransport(fc.Transport):
-    """Answers calls from a script keyed by (method, url prefix)."""
+# What the CLI printed, character for character.
+CORRUPTED_NAME = (
+    "\u0000\u0000\u0005\u0001\u0007\u0007\u0006\u0005\u0006\u0000\u0002\u0000"
+    "\u0005\u0001\u0007\u0007\u0006\u0005\u0006\u0000\u0003\u0003\u0002\u0000"
+    "\u0003\u0008\u0004\u0002"
+)
+CORRUPTED_INSTRUCT = (
+    "\u0000\u0000\u0005\u0001\u0007\u0007\u0006\u0005\u0006\u0000\u0002\u0000"
+    "\u0005\u0001\u0007\u0007\u0006\u0005\u0006\u0000\u0003\u0002\u0002\u0000"
+    "\u0003\u0005\u0002\u0000\u0003\u0000\u0002\u0000\u0003\u0005\u0004\u0002"
+    "\u0002\u0000\u0004\u0009\u0006\u0000\u0007\u0003\u0007\u0004\u0007\u0002"
+    "\u0007\u0005\u0006\u0003\u0007\u0004"
+)
 
-    def __init__(self, answers=None, fail_after=None):
-        super().__init__()
+GENESIS = "0x99c172c095340ace980631f9123544c6bebd4839f3437e463533422d8be2d631"
+
+STATUS = {
+    "network": "devnet",
+    "profile_status": "live",
+    "rpc": {"url": "wss://rpc.devnet.flop.network", "reachable": True,
+            "chain": "FLOP Devnet", "genesis_hash": GENESIS},
+    "gateway": "https://api.flop.network",
+    "faucet": {"url": "https://faucet.flop.network", "reachable": True,
+               "genesis_hash": GENESIS, "matches_rpc": True},
+}
+
+
+class FakeCli(fc.Cli):
+    """Answers by first argument, and records what it was asked to do."""
+
+    def __init__(self, answers=None, fail=None):
+        super().__init__(network="devnet", binary="flop")
         self.answers = answers or {}
-        self.fail_after = fail_after
+        self.fail = fail or {}
 
-    def call(self, method, url, body=None):
-        self.calls.append({"method": method, "url": url, "body": body})
-        if self.fail_after is not None and len(self.calls) > self.fail_after:
-            raise RuntimeError("connection lost")
-        for key, value in self.answers.items():
-            if url.startswith(key):
-                return value
-        return {}
+    def run(self, args, auth=None, spends=False):
+        key = " ".join(args[:2])
+        self.calls.append({"args": list(args), "auth": auth, "spends": spends})
+        if key in self.fail:
+            raise fc.CliError(self.fail[key])
+        return self.answers.get(key, {})
 
 
-ENDPOINTS = {name: f"https://example.test/{name}" for name in fc.ENDPOINTS}
+def happy(**extra) -> FakeCli:
+    answers = {
+        "network status": STATUS,
+        "session run": {"channel_id": "0x7f3a", "miner_paid": "0.004",
+                        "reply": "hello", "turns": 1},
+        "channel finalize": {"finalized": True, "miner_paid": "0.004"},
+        "channel list": {"channels": []},
+        "faucet request": {"amount": "25", "address": "5Fake"},
+        "model list": {"count": 2, "models": [
+            {"hash": "0xfab8", "name": CORRUPTED_NAME, "size": "medium",
+             "parameters_billion": 8, "context_window": 8192},
+            {"hash": "0x1a52", "name": CORRUPTED_INSTRUCT, "size": "small",
+             "parameters_billion": 1, "context_window": 4096},
+        ]},
+    }
+    answers.update(extra)
+    return FakeCli(answers)
 
 
 @pytest.fixture
 def config(tmp_path):
-    identity = tmp_path / "keys" / "identity.pem"
-    identity.parent.mkdir(parents=True)
-    identity.write_text("not a real key", encoding="utf-8")
+    keystore = tmp_path / "keys" / "agent.json"
+    keystore.parent.mkdir(parents=True)
+    keystore.write_text(json.dumps(
+        {"encoded": "x", "encoding": {}, "address": "5Fake"}), encoding="utf-8")
     return {
-        "did": "did:key:zTest",
-        "wallet_address": "flop1test",
-        "identity_path": str(identity),
-        "endpoints": dict(ENDPOINTS),
-        "max_spend_per_session": "100",
-        "max_spend_total": "500",
+        "network": "devnet",
+        "keystore": str(keystore),
+        "password_env": "FLOP_KEY_PASSWORD",
+        "address": "5Fake",
+        "genesis_hash": GENESIS,
+        "model": "Qwen/Qwen3-8B",
+        "miner": "5Miner",
+        "endpoint": "http://127.0.0.1:8645",
+        "max_flop_per_session": "0.01",
+        "max_flop_total": "1",
+        "max_tokens": 256,
     }
 
 
 @pytest.fixture(autouse=True)
-def isolated_state(tmp_path, monkeypatch):
-    """Nothing in this suite may read the machine it runs on.
-
-    The first version of this fixture left FLEET_ROOTS alone, so the clean
-    machine test passed on a laptop with no fleet directory and failed on the
-    server that actually had one. A test whose result depends on the host is
-    not testing the code.
-    """
+def isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(fc, "STATE_DIR", tmp_path / "sessions")
     monkeypatch.setattr(fc, "LEDGER", tmp_path / "ledger.jsonl")
+    monkeypatch.setattr(fc, "CONFIG_FILE", tmp_path / "flop.json")
     monkeypatch.setattr(fc, "FLEET_ROOTS", ())
 
 
@@ -70,241 +115,328 @@ def ledger_of(tmp_path):
     return tmp_path / "ledger.jsonl"
 
 
-# --------------------------------------------------------- unpublished surface
+# ------------------------------------------------------- the model name bug
 
 
-def test_every_endpoint_is_blank_in_the_template():
-    assert set(fc.CONFIG_TEMPLATE["endpoints"]) == set(fc.ENDPOINTS)
-    assert all(v is None for v in fc.CONFIG_TEMPLATE["endpoints"].values())
+def test_the_corrupted_devnet_name_repairs_to_what_is_recoverable():
+    """Qwen/Qwen3-8B, with the characters the CLI destroyed marked.
+
+    n, / and - each have a hex letter in their low nibble, and the CLI maps
+    every letter to zero, so they cannot come back from this output. What is
+    recoverable is recovered and the rest is marked, because a plausible guess
+    in a model slug would be worse than a gap.
+    """
+    repair = fc.repair_model_name(CORRUPTED_NAME)
+    assert repair["best_effort"] == "Qwe??Qwe?3?8B"  # 13 chars, as Qwen/Qwen3-8B is
+    assert repair["unrecoverable"] == 4
+    assert repair["corrupted"] is True
 
 
-def test_a_missing_endpoint_names_itself_and_what_it_is_for(config):
-    config["endpoints"]["faucet"] = None
-    with pytest.raises(fc.NotPublishedYet) as error:
-        fc.endpoint(config, "faucet")
-    assert "faucet" in str(error.value)
-    assert "testnet FLOP" in str(error.value)
+def test_the_instruct_model_repairs_the_same_way():
+    repair = fc.repair_model_name(CORRUPTED_INSTRUCT)
+    # Qwen/Qwen2.5-0.5B-Instruct
+    assert repair["best_effort"] == "Qwe??Qwe?2?5?0?5B?I?struct"  # 26 chars
+    assert repair["corrupted"] is True
 
 
-def test_an_unknown_endpoint_is_a_programming_error(config):
-    with pytest.raises(KeyError):
-        fc.endpoint(config, "mint_tokens")
+def test_a_clean_name_is_left_alone():
+    clean = fc.repair_model_name("")
+    assert clean["corrupted"] is False
+    assert clean["unrecoverable"] == 0
+
+
+def test_listing_models_attaches_a_repair_to_each(tmp_path):
+    models = fc.list_models(happy())
+    assert len(models) == 2
+    assert all("name_repair" in m for m in models)
+    assert models[0]["hash"] == "0xfab8"
+
+
+# ------------------------------------------------------------ the chain pin
+
+
+def test_the_first_run_records_the_genesis(config, tmp_path):
+    config["genesis_hash"] = None
+    target = tmp_path / "flop.json"
+    assert fc.pin_genesis(config, STATUS, target) == GENESIS
+    assert json.loads(target.read_text(encoding="utf-8"))["genesis_hash"] == GENESIS
+
+
+def test_a_reset_chain_is_refused(config):
+    other = dict(STATUS, rpc=dict(STATUS["rpc"], genesis_hash="0xdeadbeef"))
+    with pytest.raises(fc.ChainMismatch) as error:
+        fc.pin_genesis(config, other)
+    assert "may have been reset" in str(error.value)
+
+
+def test_a_faucet_on_another_chain_is_refused(config):
+    other = dict(STATUS, faucet=dict(STATUS["faucet"], matches_rpc=False))
+    with pytest.raises(fc.ChainMismatch) as error:
+        fc.pin_genesis(config, other)
+    assert "do not fund from it" in str(error.value)
+
+
+def test_a_chain_with_no_genesis_is_refused(config):
+    with pytest.raises(fc.ChainMismatch):
+        fc.pin_genesis(config, {"rpc": {"url": "x"}})
 
 
 # ------------------------------------------------- one participant, one score
 
 
-def test_a_second_key_beside_the_identity_stops_the_run(config):
-    Path(config["identity_path"]).with_name("spare.pem").write_text("x", encoding="utf-8")
+def test_a_second_keystore_beside_the_first_stops_the_run(config):
+    sibling = Path(config["keystore"]).with_name("spare.json")
+    sibling.write_text(json.dumps(
+        {"encoded": "y", "encoding": {}, "address": "5Other"}), encoding="utf-8")
     with pytest.raises(SystemExit) as error:
         fc.identity_guard(config)
-    assert "more than one identity" in str(error.value)
+    assert "more than one FLOP account" in str(error.value)
 
 
-def test_a_leftover_fleet_directory_stops_the_run(config, tmp_path):
-    fleet = tmp_path / "close1-fleet" / "pair-01"
-    fleet.mkdir(parents=True)
-    (fleet / "pair.json").write_text("{}", encoding="utf-8")
-    with pytest.raises(SystemExit) as error:
-        fc.identity_guard(config, extra_roots=(str(tmp_path / "close1-fleet"),))
-    assert "fleet" in str(error.value)
-
-
-def test_the_configured_fleet_roots_stop_the_run(config, tmp_path, monkeypatch):
-    fleet = tmp_path / "flop-fleet"
-    (fleet / "pair-01").mkdir(parents=True)
-    monkeypatch.setattr(fc, "FLEET_ROOTS", (fleet,))
-    with pytest.raises(SystemExit):
-        fc.identity_guard(config)
-
-
-def test_an_empty_fleet_root_is_not_a_finding(config, tmp_path, monkeypatch):
-    empty = tmp_path / "flop-fleet"
-    empty.mkdir()
-    monkeypatch.setattr(fc, "FLEET_ROOTS", (empty,))
+def test_an_ordinary_json_file_beside_the_keystore_is_not_an_account(config):
+    """The check that cries wolf gets switched off, so it reads the file."""
+    Path(config["keystore"]).with_name("settings.json").write_text(
+        json.dumps({"theme": "dark"}), encoding="utf-8")
     assert fc.identity_guard(config) == []
 
 
-def test_the_guard_is_not_switchable_from_the_environment(monkeypatch):
-    """The default roots are a constant, not a setting.
-
-    If this ever becomes env driven, the guard is one stray export away from
-    doing nothing, and it exists precisely for the night nobody is watching.
-    """
-    monkeypatch.setenv("FLOP_FLEET_ROOTS", "")
-    import importlib
-
-    reloaded = importlib.reload(fc)
-    try:
-        assert len(reloaded.FLEET_ROOTS) == 2
-        assert all(r.name.endswith("-fleet") for r in reloaded.FLEET_ROOTS)
-    finally:
-        importlib.reload(fc)
+def test_the_new_wallet_directory_stops_the_run(config, tmp_path, monkeypatch):
+    """`session run --new-wallet` drops one unencrypted wallet per run there."""
+    wallets = tmp_path / "session-wallets"
+    wallets.mkdir()
+    (wallets / "w1.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(fc, "FLEET_ROOTS", (wallets,))
+    with pytest.raises(SystemExit) as error:
+        fc.identity_guard(config)
+    assert "session-wallets" in str(error.value)
 
 
 def test_a_clean_machine_passes(config):
     assert fc.identity_guard(config) == []
 
 
-# ------------------------------------------------------------------- budget
+# ------------------------------------------------------------------ budget
 
 
-def test_zero_ceilings_refuse_to_spend_anything(config, tmp_path):
-    config["max_spend_per_session"] = "0"
-    client = fc.Client(config, FakeTransport(), ledger=ledger_of(tmp_path))
+def test_zero_ceilings_refuse_everything(config, tmp_path):
+    config["max_flop_per_session"] = "0"
+    client = fc.Client(config, happy(), ledger=ledger_of(tmp_path))
     with pytest.raises(fc.SpendRefused):
-        client.budget_check("1")
+        client.budget_check("0.001")
 
 
-def test_an_offer_over_the_session_ceiling_is_refused(config, tmp_path):
-    client = fc.Client(config, FakeTransport(), ledger=ledger_of(tmp_path))
+def test_an_escrow_over_the_session_ceiling_is_refused(config, tmp_path):
+    client = fc.Client(config, happy(), ledger=ledger_of(tmp_path))
     with pytest.raises(fc.SpendRefused) as error:
-        client.budget_check("101")
+        client.budget_check("0.02")
     assert "per session ceiling" in str(error.value)
 
 
-def test_the_total_ceiling_counts_what_already_settled(config, tmp_path):
+def test_the_total_counts_what_the_ledger_already_holds(config, tmp_path):
     ledger = ledger_of(tmp_path)
-    for _ in range(5):
-        fc.append_ledger({"amount": "90"}, ledger)
-    client = fc.Client(config, FakeTransport(), ledger=ledger)
-    assert fc.spent_so_far(ledger) == Decimal("450")
-    with pytest.raises(fc.SpendRefused) as error:
-        client.budget_check("60")
-    assert "already spent" in str(error.value)
-    assert client.budget_check("50") == Decimal("50")
+    for _ in range(99):
+        fc.append_ledger({"amount": "0.01"}, ledger)
+    client = fc.Client(config, happy(), ledger=ledger)
+    assert fc.spent_so_far(ledger) == Decimal("0.99")
+    assert client.budget_check("0.01") == Decimal("0.01")
+    with pytest.raises(fc.SpendRefused):
+        client.budget_check("0.011")
 
 
 # ---------------------------------------------------------------- a session
 
 
-def happy_transport():
-    return FakeTransport(
-        {
-            "https://example.test/market": {"offers": [{"id": "a", "price": "20"},
-                                                       {"id": "b", "price": "5"}]},
-            "https://example.test/session_open": {"session_id": "s-1"},
-            "https://example.test/session_submit": {"accepted": True},
-            "https://example.test/session_settle": {"state": "settled", "amount": "5"},
-        }
-    )
+def test_a_session_runs_and_lands_in_the_ledger(config, tmp_path):
+    cli = happy()
+    record = fc.Client(config, cli, ledger=ledger_of(tmp_path)).buy("hello")
 
-
-def test_a_session_runs_through_and_lands_in_the_ledger(config, tmp_path):
-    transport = happy_transport()
-    client = fc.Client(config, transport, ledger=ledger_of(tmp_path))
-    offer = min(client.market(), key=lambda o: Decimal(o["price"]))
-    record = client.buy(offer, {"prompt": "hello"})
-
-    assert offer["id"] == "b"  # cheapest, not first
     assert record["stage"] == "settled"
-    assert [h["stage"] for h in record["history"]] == [
-        "opened", "submitted", "settling", "settled"
-    ]
-    assert fc.spent_so_far(ledger_of(tmp_path)) == Decimal("5")
+    assert record["channel_id"] == "0x7f3a"
+    assert record["amount"] == "0.004"
+    assert fc.spent_so_far(ledger_of(tmp_path)) == Decimal("0.004")
     assert fc.open_sessions() == []
 
 
-def test_the_settlement_response_is_kept_verbatim(config, tmp_path):
-    client = fc.Client(config, happy_transport(), ledger=ledger_of(tmp_path))
-    client.buy({"id": "b", "price": "5"}, {"prompt": "hi"})
+def test_the_escrow_and_the_keystore_reach_the_command_line(config, tmp_path):
+    cli = happy()
+    fc.Client(config, cli, ledger=ledger_of(tmp_path)).buy("hello")
+    run = [c for c in cli.calls if c["args"][:2] == ["session", "run"]][0]
+    assert "--max-flop" in run["args"]
+    assert run["args"][run["args"].index("--max-flop") + 1] == "0.01"
+    assert run["auth"]["password_env"] == "FLOP_KEY_PASSWORD"
+    assert run["spends"] is True
+
+
+def test_the_prompt_is_passed_as_one_argument_not_a_shell_string(config, tmp_path):
+    """A prompt with quotes and semicolons is data, not a command."""
+    cli = happy()
+    nasty = "hello; rm -rf / && echo \"$(whoami)\""
+    fc.Client(config, cli, ledger=ledger_of(tmp_path)).buy(nasty)
+    run = [c for c in cli.calls if c["args"][:2] == ["session", "run"]][0]
+    assert nasty in run["args"]
+
+
+def test_the_settlement_output_is_kept_verbatim(config, tmp_path):
+    fc.Client(config, happy(), ledger=ledger_of(tmp_path)).buy("hello")
     entry = json.loads(ledger_of(tmp_path).read_text(encoding="utf-8").splitlines()[0])
-    assert entry["response"] == {"state": "settled", "amount": "5"}
-    assert entry["session_id"] == "s-1"
+    assert entry["result"]["reply"] == "hello"
+    assert entry["genesis_hash"] == GENESIS
+    assert entry["escrow"] == "0.01"
 
 
-def test_the_amount_comes_from_the_settlement_not_the_offer(config, tmp_path):
-    transport = happy_transport()
-    transport.answers["https://example.test/session_settle"] = {
-        "state": "settled", "amount": "4.25"
-    }
-    client = fc.Client(config, transport, ledger=ledger_of(tmp_path))
-    record = client.buy({"id": "b", "price": "5"}, {"prompt": "hi"})
-    assert record["amount"] == "4.25"
+def test_an_unconfigured_model_refuses_before_spending(config, tmp_path):
+    config["model"] = None
+    cli = happy()
+    with pytest.raises(fc.NotConfigured) as error:
+        fc.Client(config, cli, ledger=ledger_of(tmp_path)).buy("hello")
+    assert "model" in str(error.value)
+    assert cli.calls == []
 
 
-# ------------------------------------------------------------------- crashes
+def test_a_missing_keystore_refuses_before_spending(config, tmp_path):
+    config["keystore"] = None
+    cli = happy()
+    with pytest.raises(fc.NotConfigured):
+        fc.Client(config, cli, ledger=ledger_of(tmp_path)).buy("hello")
+    assert cli.calls == []
 
 
-def test_a_crash_after_submitting_leaves_a_resumable_session(config, tmp_path):
-    transport = happy_transport()
-    transport.fail_after = 2  # open succeeds, submit succeeds, settle dies
-    client = fc.Client(config, transport, ledger=ledger_of(tmp_path))
-    with pytest.raises(RuntimeError):
-        client.buy({"id": "b", "price": "5"}, {"prompt": "hi"})
+# ------------------------------------------------------------------ crashes
+
+
+def test_a_failed_session_run_leaves_the_record_open(config, tmp_path):
+    cli = happy()
+    cli.fail["session run"] = "channel 0x9ab1 opened, then the RPC dropped"
+    with pytest.raises(fc.CliError):
+        fc.Client(config, cli, ledger=ledger_of(tmp_path)).buy("hello")
 
     pending = fc.open_sessions()
     assert len(pending) == 1
-    assert pending[0]["stage"] == "settling"
-    assert pending[0]["session_id"] == "s-1"
+    assert pending[0]["stage"] == "spending"
     assert fc.spent_so_far(ledger_of(tmp_path)) == Decimal(0)
 
 
-def test_resume_settles_a_session_that_was_left_hanging(config, tmp_path):
-    transport = happy_transport()
-    transport.fail_after = 2
-    client = fc.Client(config, transport, ledger=ledger_of(tmp_path))
-    with pytest.raises(RuntimeError):
-        client.buy({"id": "b", "price": "5"}, {"prompt": "hi"})
+def test_recover_finalizes_a_channel_and_books_it(config, tmp_path):
+    cli = happy()
+    cli.fail["session run"] = "the RPC dropped"
+    with pytest.raises(fc.CliError):
+        fc.Client(config, cli, ledger=ledger_of(tmp_path)).buy("hello")
 
-    again = fc.Client(config, happy_transport(), ledger=ledger_of(tmp_path))
-    record = again.resume(fc.open_sessions()[0])
-    assert record["stage"] == "settled"
-    assert fc.spent_so_far(ledger_of(tmp_path)) == Decimal("5")
-    assert fc.open_sessions() == []
-
-
-def test_resume_takes_an_already_settled_session_from_status(config, tmp_path):
-    transport = happy_transport()
-    transport.fail_after = 2
-    client = fc.Client(config, transport, ledger=ledger_of(tmp_path))
-    with pytest.raises(RuntimeError):
-        client.buy({"id": "b", "price": "5"}, {"prompt": "hi"})
-
-    # The settlement had in fact gone through upstream before the connection died.
-    status_only = FakeTransport(
-        {"https://example.test/session_status": {"state": "settled", "amount": "5"}}
-    )
-    again = fc.Client(config, status_only, ledger=ledger_of(tmp_path))
-    record = again.resume(fc.open_sessions()[0])
-    assert record["stage"] == "settled"
-    # and it did not pay a second time
-    assert [c["url"] for c in status_only.calls if "settle" in c["url"]] == []
-
-
-def test_a_session_that_never_got_an_id_is_not_resumed(config, tmp_path):
-    transport = happy_transport()
-    transport.answers["https://example.test/session_open"] = {}
-    client = fc.Client(config, transport, ledger=ledger_of(tmp_path))
-    record = client.buy({"id": "b", "price": "5"}, {"prompt": "hi"})
-    record["stage"] = "opened"
+    record = fc.open_sessions()[0]
+    record["channel_id"] = "0x9ab1"  # read from `flop channel list` by the operator
     fc.save_session(record)
 
-    again = fc.Client(config, FakeTransport(), ledger=ledger_of(tmp_path))
-    assert again.resume(fc.open_sessions()[0])["stage"] == "failed"
+    done = fc.Client(config, happy(), ledger=ledger_of(tmp_path)).recover(record)
+    assert done["stage"] == "settled"
+    assert fc.spent_so_far(ledger_of(tmp_path)) == Decimal("0.004")
 
 
-def test_a_half_written_record_is_never_left_behind(config, tmp_path):
-    client = fc.Client(config, happy_transport(), ledger=ledger_of(tmp_path))
-    client.buy({"id": "b", "price": "5"}, {"prompt": "hi"})
+def test_a_session_with_no_channel_id_is_not_silently_closed(config, tmp_path):
+    cli = happy()
+    cli.fail["session run"] = "refused before any channel existed"
+    with pytest.raises(fc.CliError):
+        fc.Client(config, cli, ledger=ledger_of(tmp_path)).buy("hello")
+
+    record = fc.Client(config, happy(), ledger=ledger_of(tmp_path)).recover(
+        fc.open_sessions()[0]
+    )
+    assert record["stage"] == "failed"
+    assert "nothing to finalize" in record["note"]
+    assert "channel list" in record["note"]
+
+
+def test_a_refused_finalize_leaves_the_session_open_for_another_try(config, tmp_path):
+    cli = happy()
+    cli.fail["session run"] = "dropped"
+    with pytest.raises(fc.CliError):
+        fc.Client(config, cli, ledger=ledger_of(tmp_path)).buy("hello")
+    record = fc.open_sessions()[0]
+    record["channel_id"] = "0x9ab1"
+    fc.save_session(record)
+
+    stubborn = happy()
+    stubborn.fail["channel finalize"] = "challenge window has not closed"
+    again = fc.Client(config, stubborn, ledger=ledger_of(tmp_path)).recover(record)
+    assert again["stage"] != "settled"
+    assert fc.open_sessions()
+    assert "challenge window" in again["note"]
+
+
+def test_no_half_written_session_record_survives(config, tmp_path):
+    fc.Client(config, happy(), ledger=ledger_of(tmp_path)).buy("hello")
     for path in fc.STATE_DIR.glob("*"):
-        assert path.suffix == ".json"  # no .tmp survives
+        assert path.suffix == ".json"
         json.loads(path.read_text(encoding="utf-8"))
 
 
-# -------------------------------------------------------------------- config
+# ------------------------------------------------------- reading the output
 
 
-def test_a_written_config_is_private(tmp_path, monkeypatch):
-    target = tmp_path / "flop.json"
-    monkeypatch.setattr(fc, "CONFIG_FILE", target)
-    fc.write_config(dict(fc.CONFIG_TEMPLATE), target)
-    assert target.stat().st_mode & 0o077 == 0
+def test_the_channel_id_is_found_in_a_nested_payload():
+    assert fc.channel_id_of({"settlement": {"channelId": "0xabc1"}}) == "0xabc1"
 
 
-def test_load_fills_in_endpoints_added_after_the_file_was_written(tmp_path):
-    target = tmp_path / "flop.json"
-    target.write_text(json.dumps({"did": "x", "endpoints": {"faucet": "u"}}), encoding="utf-8")
-    config = fc.load_config(target)
-    assert config["endpoints"]["faucet"] == "u"
-    assert config["endpoints"]["market"] is None
+def test_the_channel_id_is_found_in_prose_when_the_shape_moves():
+    """The JSON shape of session run is undocumented and has moved."""
+    assert fc.channel_id_of({"message": "opened channel_id 0x5f2e ok"}) == "0x5f2e"
+
+
+def test_no_channel_id_reads_as_empty_not_as_a_guess():
+    assert fc.channel_id_of({"reply": "hello"}) == ""
+
+
+def test_the_escrow_is_the_fallback_amount_when_none_is_reported():
+    """Cooperative settlement pays the reserved escrow, so this is not low."""
+    assert fc.paid_amount({"reply": "hi"}, "0.01") == "0.01"
+
+
+def test_a_reported_amount_wins_over_the_escrow():
+    assert fc.paid_amount({"miner_paid": "0.004"}, "0.01") == "0.004"
+
+
+# ---------------------------------------------------------- the CLI wrapper
+
+
+def test_a_missing_binary_says_how_to_install_it(monkeypatch):
+    cli = fc.Cli(binary="definitely-not-a-real-binary-xyz")
+    with pytest.raises(fc.CliError) as error:
+        cli.run(["network", "status"])
+    assert "@flop-labs/cli" in str(error.value)
+
+
+def test_the_network_and_output_mode_are_always_passed():
+    argv = fc.Cli(network="devnet").argv(["model", "list"])
+    assert argv[1:5] == ["--network", "devnet", "--output", "json"]
+
+
+def test_the_keystore_is_only_passed_when_there_is_one():
+    plain = fc.Cli().argv(["model", "list"])
+    assert "--keystore" not in plain
+    signed = fc.Cli().argv(["session", "run"],
+                           {"keystore": "/k/agent.json", "password_env": "P"})
+    assert signed[signed.index("--keystore") + 1] == "/k/agent.json"
+    assert signed[signed.index("--password-env") + 1] == "P"
+
+
+def test_a_dry_run_reports_the_command_and_calls_nothing():
+    cli = fc.Cli(dry_run=True)
+    out = cli.run(["session", "run", "--prompt", "hi"])
+    assert out["dry_run"] is True
+    assert "--output" in out["argv"]
+
+
+def test_the_version_is_not_parsed_as_json(monkeypatch):
+    """`--version` ignores --output json and prints a bare string.
+
+    Found by running doctor against the real binary: routing it through run()
+    failed with "did not answer with JSON: '0.4.0'".
+    """
+    cli = fc.Cli()
+    monkeypatch.setattr(cli, "text", lambda args: "0.4.0")
+    assert cli.version() == "0.4.0"
+
+
+def test_the_version_call_does_not_pass_the_network_flags():
+    cli = fc.Cli(dry_run=True)
+    cli.version()
+    assert cli.calls[-1]["argv"] == ["flop", "--version"]
