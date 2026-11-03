@@ -71,16 +71,33 @@ CLOSED_MARKERS = (
 # changes are nothing. A new one of these is not nothing.
 SIGNAL_WORDS = ("faucet", "rpc", "bootnode", "gateway", "chain spec", "genesis")
 
+# The stronger signal, added on 3 November after the first version missed the
+# devnet opening. A keyword is a guess about how FLOP will word something; a
+# hostname is the thing itself. Every endpoint FLOP has published so far lives
+# under flop.network or flop.finance, so collecting those names and noticing a
+# new one catches rpc.testnet.flop.network on the day it appears without anyone
+# having guessed that string in advance.
+HOST_RE = re.compile(r"\b(?:[a-z0-9-]+\.)+flop\.(?:network|finance)\b")
+
 # label, url, and whether the page carries gate text. A page that never said
 # "unavailable" cannot stop saying it, so reporting it as newly open would be
 # a false alarm every single morning. Found by running this against the real
 # pages rather than by reasoning about it.
 WATCH = (
-    ("devnet", "https://ask.flop.finance/networks/devnet", True),
-    ("testnet", "https://ask.flop.finance/networks/testnet", True),
+    # docs.flop.network is where the operator documentation actually lives.
+    # The first version of this watcher knew only ask.flop.finance, whose
+    # pages still said nothing was available on the morning the devnet opened
+    # with a faucet, an API, an MCP server and an SDK. Watching the wrong
+    # domain is indistinguishable from not watching.
+    ("docs-devnet", "https://docs.flop.network/networks/devnet", True),
+    ("docs-testnet", "https://docs.flop.network/networks/testnet", True),
+    ("official", "https://flop.finance/official/", False),
+    ("docs-index", "https://docs.flop.network/", True),
+    ("ask-devnet", "https://ask.flop.finance/networks/devnet", True),
+    ("ask-testnet", "https://ask.flop.finance/networks/testnet", True),
     ("operators", "https://ask.flop.finance/operators", True),
     ("testnet-page", "https://flop.finance/testnet/", True),
-    ("run-miner", "https://ask.flop.finance/docs/run-miner", False),
+    ("run-miner", "https://ask.flop.finance/docs/run-miner", True),
     ("llms", "https://flop.finance/llms.txt", False),
 )
 
@@ -132,6 +149,15 @@ def signals(text: str) -> list:
     return [word for word in SIGNAL_WORDS if word in text]
 
 
+def hosts(text: str) -> list:
+    """Every FLOP hostname the page names, deduplicated and sorted.
+
+    Sorted so the stored list is comparable run to run, and deduplicated so a
+    page that repeats its own API base forty times is not forty findings.
+    """
+    return sorted(set(HOST_RE.findall(text)))
+
+
 def check(label: str, url: str, gated: bool = True, fetch=fetch_text) -> dict:
     try:
         text = plain(fetch(url))
@@ -144,6 +170,7 @@ def check(label: str, url: str, gated: bool = True, fetch=fetch_text) -> dict:
         "digest": digest(text),
         "bytes": len(text),
         "signals": signals(text),
+        "hosts": hosts(text),
     }
     result.update(verdict(text))
     return result
@@ -186,7 +213,12 @@ def run(fetch=fetch_text, state_path: Path = None, log_path: Path = None) -> dic
     """Check every page, compare with what was stored, remember the result."""
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     state = load_state(state_path)
-    checks, opened, reworded, errors, new_signals = [], [], [], [], []
+    checks, opened, reworded, errors, new_signals, new_hosts = [], [], [], [], [], []
+    known_hosts = {h for entry in state.values() for h in (entry.get("hosts") or [])}
+    # Captured before the loop: state fills up as pages are checked, so asking
+    # whether it is empty halfway through would say no for the later pages and
+    # report their hostnames as new on the very first run.
+    first_run = not state
 
     for label, url, gated in WATCH:
         result = check(label, url, gated, fetch)
@@ -200,10 +232,18 @@ def run(fetch=fetch_text, state_path: Path = None, log_path: Path = None) -> dic
 
         fresh = [s for s in result["signals"] if s not in (prior.get("signals") or [])]
         result["new_signals"] = fresh
+        # Measured against every host seen on any page, not just this one, so
+        # the same API base appearing on a second page is not a finding. On a
+        # first run there is nothing to compare against and nothing is news.
+        result["new_hosts"] = (
+            [] if first_run else [h for h in result["hosts"] if h not in known_hosts]
+        )
 
         if gated and prior.get("closed") is True and result["closed"] is False:
             opened.append(result)
             prior["opened_at"] = now
+        if result["new_hosts"]:
+            new_hosts.append(result)
         elif fresh and prior.get("digest"):
             new_signals.append(result)
         elif prior.get("digest") and prior["digest"] != result["digest"]:
@@ -215,6 +255,7 @@ def run(fetch=fetch_text, state_path: Path = None, log_path: Path = None) -> dic
             "closed": result["closed"],
             "markers": result["markers"],
             "signals": result["signals"],
+            "hosts": result["hosts"],
             "digest": result["digest"],
             "first_seen": prior.get("first_seen", now),
             "last_checked": now,
@@ -230,6 +271,7 @@ def run(fetch=fetch_text, state_path: Path = None, log_path: Path = None) -> dic
         "opened": opened,
         "reworded": reworded,
         "new_signals": new_signals,
+        "new_hosts": new_hosts,
         "errors": errors,
         "still_closed": sum(1 for c in checks if c.get("closed")),
         "gated": sum(1 for c in checks if c.get("gated") and not c.get("error")),
@@ -238,6 +280,11 @@ def run(fetch=fetch_text, state_path: Path = None, log_path: Path = None) -> dic
     if opened:
         append_log({"at": now, "event": "page_opened",
                     "pages": [{"label": o["label"], "url": o["url"]} for o in opened]},
+                   log_path)
+    if new_hosts:
+        append_log({"at": now, "event": "new_hosts",
+                    "pages": [{"label": h["label"], "url": h["url"],
+                               "hosts": h["new_hosts"]} for h in new_hosts]},
                    log_path)
     if new_signals:
         append_log({"at": now, "event": "new_signal_words",
@@ -268,11 +315,16 @@ def lines(report: dict) -> list:
         out.append("")
         out.append(f"CHANGED: {names} stopped saying nothing is available.")
         out.append("Read the page, then fill flop.json and set the spend ceilings.")
+    for result in report["new_hosts"]:
+        found = ", ".join(result["new_hosts"])
+        out.append(f"\nNEW HOST on {result['label']}: {found}")
+        out.append("That is an endpoint nobody had published before. Read the page.")
     if report["new_signals"]:
         for result in report["new_signals"]:
             words = ", ".join(result["new_signals"])
             out.append(f"\nNEW on {result['label']}: {words}. Worth reading today.")
-    if not report["opened"] and not report["new_signals"] and report["reworded"]:
+    if not any((report["opened"], report["new_hosts"], report["new_signals"])) \
+            and report["reworded"]:
         names = ", ".join(r["label"] for r in report["reworded"])
         out.append(f"\n{len(report['reworded'])} page(s) reworded, nothing opened: {names}")
     return out
@@ -284,11 +336,13 @@ def main(argv=None) -> int:
                         help="print nothing unless something changed")
     args = parser.parse_args(argv)
     report = run()
-    quiet_day = not (report["opened"] or report["new_signals"] or report["reworded"])
+    quiet_day = not any(
+        (report["opened"], report["new_hosts"], report["new_signals"], report["reworded"])
+    )
     if args.quiet and quiet_day:
         return 0
     print(f"flop readiness {report['at']}: {report['still_closed']} of "
-          f"{report['gated']} gated page(s) still say nothing is available")
+          f"{report['read']} page(s) read still say nothing is available")
     for line in lines(report):
         print(line)
     return 0

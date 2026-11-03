@@ -114,11 +114,11 @@ def test_a_page_that_opens_is_the_loud_case(paths):
     pages["https://ask.flop.finance/networks/devnet"] = OPEN_PAGE
     report = fw.run(fetcher(pages), state, log)
 
-    assert [o["label"] for o in report["opened"]] == ["devnet"]
+    assert [o["label"] for o in report["opened"]] == ["ask-devnet"]
     assert "NO LONGER CLOSED" in "\n".join(fw.lines(report))
     entry = json.loads(log.read_text(encoding="utf-8").splitlines()[0])
     assert entry["event"] == "page_opened"
-    assert entry["pages"][0]["label"] == "devnet"
+    assert entry["pages"][0]["label"] == "ask-devnet"
 
 
 def test_an_opening_is_announced_once_not_every_day(paths):
@@ -129,7 +129,8 @@ def test_an_opening_is_announced_once_not_every_day(paths):
     fw.run(fetcher(pages), state, log)
     report = fw.run(fetcher(pages), state, log)
     assert report["opened"] == []
-    assert len(log.read_text(encoding="utf-8").splitlines()) == 1
+    events = [json.loads(l)["event"] for l in log.read_text(encoding="utf-8").splitlines()]
+    assert events.count("page_opened") == 1
 
 
 def test_the_opening_time_is_kept(paths):
@@ -170,7 +171,7 @@ def test_a_page_that_fails_to_load_is_not_an_opening(paths):
     report = fw.run(fetcher(pages), state, log)
 
     assert report["opened"] == []
-    assert [e["label"] for e in report["errors"]] == ["testnet"]
+    assert [e["label"] for e in report["errors"]] == ["ask-testnet"]
     assert not log.exists()
 
 
@@ -267,3 +268,78 @@ def test_every_watched_page_is_stored_under_its_own_url(paths):
     fw.run(fetcher(all_closed()), state, log)
     stored = fw.load_state(state)
     assert set(stored) == {url for _, url, _gated in fw.WATCH}
+
+
+# ----------------------------------------------------------- hostnames found
+
+
+def test_flop_hostnames_are_picked_out_of_a_page():
+    text = fw.plain(
+        "<p>api.flop.network and faucet.flop.network and rpc.devnet.flop.network</p>"
+    )
+    assert fw.hosts(text) == [
+        "api.flop.network", "faucet.flop.network", "rpc.devnet.flop.network"
+    ]
+
+
+def test_a_repeated_hostname_is_one_finding_not_forty():
+    text = fw.plain("<p>api.flop.network api.flop.network api.flop.network</p>")
+    assert fw.hosts(text) == ["api.flop.network"]
+
+
+def test_an_unrelated_hostname_is_ignored():
+    text = fw.plain("<p>example.com and docs.example.org</p>")
+    assert fw.hosts(text) == []
+
+
+def test_a_first_run_treats_no_hostname_as_new(paths):
+    """Otherwise the first morning reports every endpoint FLOP ever published."""
+    state, log = paths
+    pages = {url: CLOSED_PAGE for _, url, _g in fw.WATCH}
+    pages["https://flop.finance/official/"] = "<p>api.flop.network</p>"
+    report = fw.run(fetcher(pages), state, log)
+    assert report["new_hosts"] == []
+    assert not log.exists()
+
+
+def test_a_hostname_that_appears_later_is_the_signal(paths):
+    """The case that was missed on 3 November 2026.
+
+    A testnet RPC appearing under a name nobody had guessed in advance is
+    exactly what the keyword list could not catch and this can.
+    """
+    state, log = paths
+    pages = {url: CLOSED_PAGE for _, url, _g in fw.WATCH}
+    fw.run(fetcher(pages), state, log)
+
+    pages["https://docs.flop.network/networks/testnet"] = (
+        "<p>RPC: rpc.testnet.flop.network</p><p>no verified public value</p>"
+    )
+    report = fw.run(fetcher(pages), state, log)
+
+    assert [h["label"] for h in report["new_hosts"]] == ["docs-testnet"]
+    assert report["new_hosts"][0]["new_hosts"] == ["rpc.testnet.flop.network"]
+    rendered = "\n".join(fw.lines(report))
+    assert "NEW HOST on docs-testnet: rpc.testnet.flop.network" in rendered
+    entry = json.loads(log.read_text(encoding="utf-8").splitlines()[0])
+    assert entry["event"] == "new_hosts"
+
+
+def test_a_hostname_already_seen_on_another_page_is_not_new(paths):
+    """The same API base on a second page is not an announcement."""
+    state, log = paths
+    pages = {url: CLOSED_PAGE for _, url, _g in fw.WATCH}
+    pages["https://flop.finance/official/"] = "<p>api.flop.network</p>"
+    fw.run(fetcher(pages), state, log)
+
+    pages["https://docs.flop.network/"] = "<p>see api.flop.network</p>"
+    report = fw.run(fetcher(pages), state, log)
+    assert report["new_hosts"] == []
+
+
+def test_the_docs_domain_is_watched():
+    """The gap that made the watcher useless on the day it mattered."""
+    watched = {url for _, url, _g in fw.WATCH}
+    assert "https://docs.flop.network/networks/testnet" in watched
+    assert "https://docs.flop.network/networks/devnet" in watched
+    assert "https://flop.finance/official/" in watched
