@@ -88,6 +88,12 @@ CONFIG_TEMPLATE = {
     "address": None,
     "genesis_hash": None,
     "model": None,
+    # How to buy. "chat" sends a one shot prompt that settles on chain under
+    # the signer and needs no miner. "session" goes direct to a named miner
+    # and needs that miner's reachable session endpoint, which on devnet on
+    # 3 November 2026 none of the three active miners published, so chat is
+    # the only path that actually works today.
+    "buy_via": "chat",
     "miner": None,
     "endpoint": None,
     "max_flop_per_session": "0",
@@ -113,6 +119,41 @@ class ChainMismatch(RuntimeError):
 
 
 # ---------------------------------------------------------------- the CLI
+
+
+def error_detail(stdout: str, stderr: str) -> str:
+    """What actually went wrong, out of a failed CLI run.
+
+    On success the CLI puts its JSON on stdout. On failure it puts a JSON
+    error object on STDERR, leaves stdout empty, and then appends an RPC
+    disconnect line, so neither "parse stdout" nor "take the last line of
+    stderr" finds the message: the first gets nothing and the second gets `}`.
+    Found when a real faucet call failed and the client reported
+    `faucet request 5Cry... exited 1: }`, which says nothing at all.
+    """
+    for text in (stderr or "", stdout or ""):
+        start, end = text.find("{"), text.rfind("}")
+        if start == -1 or end <= start:
+            continue
+        try:
+            body = json.loads(text[start:end + 1])
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(body, dict):
+            continue
+        parts = [str(body[k]) for k in ("code", "message") if body.get(k)]
+        if body.get("next"):
+            parts.append(f"next: {body['next']}")
+        if body.get("retryable") is not None:
+            parts.append(f"retryable={body['retryable']}")
+        if parts:
+            return " | ".join(parts)
+    lines = [
+        line.strip()
+        for line in ((stderr or "") + "\n" + (stdout or "")).splitlines()
+        if line.strip() and line.strip() not in "{}[]"
+    ]
+    return " / ".join(lines[-3:]) if lines else "no output"
 
 
 class Cli:
@@ -191,10 +232,9 @@ class Cli:
                 + (". It may have spent; run recover before retrying." if spends else "")
             ) from error
         if done.returncode != 0:
-            tail = (done.stderr or done.stdout or "").strip().splitlines()
             raise CliError(
                 f"{' '.join(args)} exited {done.returncode}: "
-                + (tail[-1] if tail else "no output")
+                + error_detail(done.stdout, done.stderr)
             )
         out = (done.stdout or "").strip()
         if not out:
@@ -420,7 +460,7 @@ def append_ledger(record: dict, ledger: Path = None) -> Path:
 
 # -------------------------------------------------------------- the session
 
-STAGES = ("opening", "spending", "settled", "failed")
+STAGES = ("opening", "spending", "settled", "failed", "dry_run")
 
 
 def session_path(local_id: str) -> Path:
@@ -446,7 +486,7 @@ def open_sessions() -> list:
             record = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             continue
-        if record.get("stage") not in ("settled", "failed"):
+        if record.get("stage") not in ("settled", "failed", "dry_run"):
             records.append(record)
     return records
 
@@ -554,14 +594,19 @@ class Client:
         is the price. That is why the record is written first and the ceiling is
         checked against the ledger rather than guessed per run.
         """
-        missing = required(self.config, "model", "miner", "endpoint")
+        via = (self.config.get("buy_via") or "chat").lower()
+        if via not in ("chat", "session"):
+            raise NotConfigured(f"buy_via must be 'chat' or 'session', not {via!r}")
+        needed = ("model",) if via == "chat" else ("model", "miner", "endpoint")
+        missing = required(self.config, *needed)
         if missing:
             raise NotConfigured(
                 "set " + ", ".join(missing) + f" in {CONFIG_FILE}.\n"
-                "  model is the exact registered slug, read by a person: the CLI\n"
-                "  corrupts model names, so it is not taken from `model list`.\n"
-                "  miner is the serving miner's SS58 account, endpoint its\n"
-                "  reachable session endpoint."
+                "  model is the exact registered id, read by a person: the CLI\n"
+                "  corrupts model names, so it is never taken from `model list`.\n"
+                "  The gateway at api.flop.network/v1/models reports the real\n"
+                "  name under x-flop.registry_model.\n"
+                "  miner and endpoint are needed only for buy_via 'session'."
             )
         escrow = self.budget_check(
             escrow if escrow is not None else self.config["max_flop_per_session"]
@@ -578,20 +623,33 @@ class Client:
             "miner": self.config["miner"],
             "escrow": str(escrow),
             "started": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "buy_via": via,
             "history": [],
         }
         self._advance(record, "spending")
 
-        args = [
-            "session", "run",
-            "--miner", self.config["miner"],
-            "--model", self.config["model"],
-            "--prompt", prompt,
-            "--max-flop", str(escrow),
-            "--max-tokens", str(self.config.get("max_tokens") or 256),
-            "--via", self.config.get("via") or "auto",
-            "--endpoint", self.config["endpoint"],
-        ]
+        if via == "chat":
+            # The prompt is a positional argument here, not --prompt, and
+            # --max-flop is documented as a per turn cap rather than a
+            # reserved escrow, so what is actually paid may be less. The
+            # ledger records whatever the settlement reports and falls back
+            # to the cap, which errs high rather than low.
+            args = [
+                "chat", prompt,
+                "--model", self.config["model"],
+                "--max-flop", str(escrow),
+            ]
+        else:
+            args = [
+                "session", "run",
+                "--miner", self.config["miner"],
+                "--model", self.config["model"],
+                "--prompt", prompt,
+                "--max-flop", str(escrow),
+                "--max-tokens", str(self.config.get("max_tokens") or 256),
+                "--via", self.config.get("via") or "auto",
+                "--endpoint", self.config["endpoint"],
+            ]
         try:
             result = self.cli.run(args, auth=auth, spends=True)
         except CliError as error:
@@ -641,6 +699,15 @@ class Client:
         save_session(record)
 
     def _finish(self, record: dict, result) -> dict:
+        if isinstance(result, dict) and result.get("dry_run"):
+            # A run that spent nothing must not move the running total. The
+            # first version booked the escrow as spent on every dry run, which
+            # would have made the ceiling refuse real work later for sessions
+            # that never happened.
+            record["result"] = result
+            record["amount"] = "0"
+            self._advance(record, "dry_run")
+            return record
         record["amount"] = paid_amount(result, record["escrow"])
         self._advance(record, "settled")
         append_ledger(

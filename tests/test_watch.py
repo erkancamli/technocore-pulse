@@ -343,3 +343,115 @@ def test_the_docs_domain_is_watched():
     assert "https://docs.flop.network/networks/testnet" in watched
     assert "https://docs.flop.network/networks/devnet" in watched
     assert "https://flop.finance/official/" in watched
+
+
+# ------------------------------------------------------------- supply probes
+
+
+EMPTY_SUPPLY = {
+    "flop_list_session_offers": {"data": [], "pagination": {"total": 0}},
+    "flop_list_providers": {"providers": [], "count": 0},
+    "flop_find_best_miner": {"topMiners": [], "totalCandidates": 0,
+                             "recommendation": "No miners match criteria"},
+}
+
+LIVE_SUPPLY = {
+    "flop_list_session_offers": {"data": [{"miner": "5X"}], "pagination": {"total": 1}},
+    "flop_list_providers": {"providers": [{"id": "p"}], "count": 1},
+    "flop_find_best_miner": {"topMiners": [{"miner": "5X"}], "totalCandidates": 1},
+}
+
+
+def poster(answers: dict, fail: set = ()):
+    """Stand in for the hosted MCP, shaped like its real event stream reply."""
+    def post(payload):
+        name = payload["params"]["name"]
+        if name in fail:
+            raise RuntimeError("unreachable: connection refused")
+        return {"content": [{"type": "text",
+                             "text": json.dumps(answers[name])}]}
+    return post
+
+
+@pytest.fixture(autouse=True)
+def no_network_mcp(monkeypatch):
+    """Nothing in this suite may reach the real MCP.
+
+    The first version of the supply probe took the poster as a default
+    argument, which bound the real one at import time. Adding this fixture
+    made twelve existing tests fail at once, which is how it came out that
+    the whole suite had been calling the network.
+    """
+    monkeypatch.setattr(fw, "mcp_post", poster(EMPTY_SUPPLY))
+
+
+def test_zero_offers_read_as_zero_not_as_an_error():
+    assert fw.supply(poster(EMPTY_SUPPLY)) == {
+        "offers": 0, "providers": 0, "candidates": 0
+    }
+
+
+def test_counts_are_read_from_each_tool_s_own_shape():
+    assert fw.supply(poster(LIVE_SUPPLY)) == {
+        "offers": 1, "providers": 1, "candidates": 1
+    }
+
+
+def test_a_probe_that_fails_is_recorded_as_an_error_not_a_zero():
+    out = fw.supply(poster(EMPTY_SUPPLY, fail={"flop_list_providers"}))
+    assert out["offers"] == 0
+    assert isinstance(out["providers"], dict)
+    assert "unreachable" in out["providers"]["error"]
+
+
+def test_supply_staying_at_zero_is_not_news(paths):
+    state, log = paths
+    pages = {url: CLOSED_PAGE for _, url, _g in fw.WATCH}
+    post = poster(EMPTY_SUPPLY)
+    fw.run(fetcher(pages), state, log, post)
+    report = fw.run(fetcher(pages), state, log, post)
+    assert report["supply"] == {"offers": 0, "providers": 0, "candidates": 0}
+    assert report["supply_appeared"] == []
+    assert not log.exists()
+
+
+def test_a_miner_appearing_is_the_loud_case(paths):
+    """Zero to one is the moment the devnet rehearsal becomes possible."""
+    state, log = paths
+    pages = {url: CLOSED_PAGE for _, url, _g in fw.WATCH}
+    fw.run(fetcher(pages), state, log, poster(EMPTY_SUPPLY))
+    report = fw.run(fetcher(pages), state, log, poster(LIVE_SUPPLY))
+
+    assert sorted(report["supply_appeared"]) == ["candidates", "offers", "providers"]
+    rendered = "\n".join(fw.lines(report))
+    assert "SUPPLY APPEARED" in rendered
+    assert "run the devnet rehearsal" in rendered.lower()
+    entry = json.loads(log.read_text(encoding="utf-8").splitlines()[0])
+    assert entry["event"] == "supply_appeared"
+    assert entry["counts"]["offers"] == 1
+
+
+def test_the_first_run_does_not_announce_supply(paths):
+    """With nothing stored there is no zero to have risen from."""
+    state, log = paths
+    pages = {url: CLOSED_PAGE for _, url, _g in fw.WATCH}
+    report = fw.run(fetcher(pages), state, log, poster(LIVE_SUPPLY))
+    assert report["supply_appeared"] == []
+    assert not log.exists()
+
+
+def test_a_failed_probe_keeps_the_last_known_count(paths):
+    state, log = paths
+    pages = {url: CLOSED_PAGE for _, url, _g in fw.WATCH}
+    fw.run(fetcher(pages), state, log, poster(LIVE_SUPPLY))
+    fw.run(fetcher(pages), state, log, poster(EMPTY_SUPPLY, fail=set(EMPTY_SUPPLY)))
+    kept = fw.load_state(fw.supply_state_path(state))
+    assert kept == {"offers": 1, "providers": 1, "candidates": 1}
+
+
+def test_supply_is_stored_beside_the_page_state_not_inside_it(paths):
+    state, log = paths
+    pages = {url: CLOSED_PAGE for _, url, _g in fw.WATCH}
+    fw.run(fetcher(pages), state, log, poster(EMPTY_SUPPLY))
+    assert set(fw.load_state(state)) == {url for _, url, _g in fw.WATCH}
+    assert fw.supply_state_path(state).exists()

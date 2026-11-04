@@ -104,6 +104,27 @@ WATCH = (
 TAG_RE = re.compile(r"<[^>]+>")
 SPACE_RE = re.compile(r"\s+")
 
+# The supply side, asked of the network's own read only MCP rather than
+# inferred from a web page. On 4 November 2026 the gateway advertised the one
+# devnet model as availability "ready", residency "loaded", capacity 11688
+# tokens a minute, and listed eight priced miners, while these three answers
+# were all zero and a real request came back "no admitted miner for model
+# ... and budget". A page that says ready is not supply; a signed offer is.
+MCP_URL = os.environ.get("FLOP_MCP_URL", "https://mcp.flop.network/mcp")
+
+# The one model registered on devnet, by hash. Names cannot be used: the CLI
+# corrupts them, so the hash is the only identifier that survives.
+MODEL_HASH = os.environ.get(
+    "FLOP_MODEL_HASH",
+    "0x1a52c1abe781db051e70ae357f72bb70161ca0c092df0b618f22a9292ba63306",
+)
+
+SUPPLY_PROBES = (
+    ("offers", "flop_list_session_offers", {}),
+    ("providers", "flop_list_providers", {}),
+    ("candidates", "flop_find_best_miner", {"model_hash": MODEL_HASH}),
+)
+
 
 def fetch_text(url: str, timeout: float = TIMEOUT_SECONDS) -> str:
     """One page as text. Raises on anything that is not a readable response."""
@@ -176,6 +197,106 @@ def check(label: str, url: str, gated: bool = True, fetch=fetch_text) -> dict:
     return result
 
 
+def mcp_post(payload: dict, timeout: float = TIMEOUT_SECONDS) -> dict:
+    """One JSON-RPC call to the hosted MCP, which answers as an event stream.
+
+    The server replies with `event:`/`data:` lines rather than a JSON body,
+    so the payload is pulled out of the data lines. It needs no session and
+    no key: the hosted server is read only.
+    """
+    request = Request(
+        MCP_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "content-type": "application/json",
+            "accept": "application/json, text/event-stream",
+            "user-agent": "flop-watch/0.1",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            raw = response.read().decode("utf-8", "replace")
+    except HTTPError as error:
+        raise RuntimeError(f"HTTP {error.code}") from error
+    except URLError as error:
+        raise RuntimeError(f"unreachable: {error.reason}") from error
+    for line in raw.splitlines():
+        if not line.startswith("data: "):
+            continue
+        try:
+            body = json.loads(line[6:])
+        except json.JSONDecodeError:
+            continue
+        if body.get("error"):
+            raise RuntimeError(str(body["error"])[:200])
+        return body.get("result") or {}
+    raise RuntimeError("no data line in the event stream")
+
+
+def mcp_tool(name: str, arguments: dict, post=mcp_post) -> dict:
+    """Call one MCP tool and parse the JSON it returns as text."""
+    result = post({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": name, "arguments": arguments},
+    })
+    for block in result.get("content") or []:
+        text = block.get("text") or ""
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            raise RuntimeError(text[:200])
+    return {}
+
+
+def count_of(name: str, answer: dict) -> int:
+    """How many of the thing this tool was asked about actually exist."""
+    if name == "flop_list_session_offers":
+        pagination = answer.get("pagination") or {}
+        if "total" in pagination:
+            return int(pagination["total"])
+        return len(answer.get("data") or [])
+    if name == "flop_list_providers":
+        if "count" in answer:
+            return int(answer["count"])
+        return len(answer.get("providers") or [])
+    if name == "flop_find_best_miner":
+        if "totalCandidates" in answer:
+            return int(answer["totalCandidates"])
+        return len(answer.get("topMiners") or [])
+    raise KeyError(f"no count rule for {name}")
+
+
+def supply(post=mcp_post) -> dict:
+    """Signed offers, listed providers and candidate miners, or the error."""
+    out = {}
+    for label, tool, arguments in SUPPLY_PROBES:
+        try:
+            out[label] = count_of(tool, mcp_tool(tool, arguments, post))
+        except (RuntimeError, KeyError, ValueError, TypeError) as error:
+            out[label] = {"error": str(error)[:160]}
+    return out
+
+
+def supply_lines(now: dict, before: dict) -> list:
+    """What to say about the supply side, loud only when it stops being zero."""
+    out, appeared = [], []
+    for label, _tool, _args in SUPPLY_PROBES:
+        value = now.get(label)
+        if isinstance(value, dict):
+            out.append(f"  supply {label:<11} could not read ({value['error']})")
+            continue
+        was = before.get(label)
+        out.append(f"  supply {label:<11} {value}")
+        if value > 0 and isinstance(was, int) and was == 0:
+            appeared.append(f"{label} {was} to {value}")
+    if appeared:
+        out.append("")
+        out.append("SUPPLY APPEARED: " + ", ".join(appeared))
+        out.append("A miner can be bought from now. Run the devnet rehearsal.")
+    return out
+
+
 def load_state(path: Path = None) -> dict:
     target = path or STATE_FILE
     if not target.exists():
@@ -184,6 +305,17 @@ def load_state(path: Path = None) -> dict:
         return json.loads(target.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
+
+
+def supply_state_path(state_path: Path = None) -> Path:
+    """Kept beside the page state, not inside it.
+
+    The page state is keyed by URL and several things assume that, so the
+    supply counts get their own file rather than a special key that every
+    loop over the state would then have to skip.
+    """
+    base = Path(state_path or STATE_FILE)
+    return base.with_name(base.stem + "-supply.json")
 
 
 def save_state(state: dict, path: Path = None) -> Path:
@@ -209,8 +341,13 @@ def append_log(entry: dict, path: Path = None) -> Path:
     return target
 
 
-def run(fetch=fetch_text, state_path: Path = None, log_path: Path = None) -> dict:
+def run(fetch=fetch_text, state_path: Path = None, log_path: Path = None,
+        post=None) -> dict:
     """Check every page, compare with what was stored, remember the result."""
+    # Resolved here, not in the signature, so a test can replace the module
+    # level default. Bound as a default argument it could not be, and the
+    # suite would quietly reach the real network.
+    post = post or mcp_post
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     state = load_state(state_path)
     checks, opened, reworded, errors, new_signals, new_hosts = [], [], [], [], [], []
@@ -265,6 +402,23 @@ def run(fetch=fetch_text, state_path: Path = None, log_path: Path = None) -> dic
         }
 
     save_state(state, state_path)
+
+    supply_file = supply_state_path(state_path)
+    before_supply = load_state(supply_file)
+    now_supply = supply(post)
+    appeared = [
+        label for label, _t, _a in SUPPLY_PROBES
+        if isinstance(now_supply.get(label), int) and now_supply[label] > 0
+        and isinstance(before_supply.get(label), int) and before_supply[label] == 0
+    ]
+    # A probe that failed keeps whatever was last known, for the same reason a
+    # page that failed to load does: an outage is not an opening.
+    merged = dict(before_supply)
+    for label, value in now_supply.items():
+        if not isinstance(value, dict):
+            merged[label] = value
+    save_state(merged, supply_file)
+
     report = {
         "at": now,
         "checks": checks,
@@ -272,6 +426,9 @@ def run(fetch=fetch_text, state_path: Path = None, log_path: Path = None) -> dic
         "reworded": reworded,
         "new_signals": new_signals,
         "new_hosts": new_hosts,
+        "supply": now_supply,
+        "supply_before": before_supply,
+        "supply_appeared": appeared,
         "errors": errors,
         "still_closed": sum(1 for c in checks if c.get("closed")),
         "gated": sum(1 for c in checks if c.get("gated") and not c.get("error")),
@@ -280,6 +437,11 @@ def run(fetch=fetch_text, state_path: Path = None, log_path: Path = None) -> dic
     if opened:
         append_log({"at": now, "event": "page_opened",
                     "pages": [{"label": o["label"], "url": o["url"]} for o in opened]},
+                   log_path)
+    if appeared:
+        append_log({"at": now, "event": "supply_appeared",
+                    "counts": {k: v for k, v in now_supply.items()
+                               if not isinstance(v, dict)}},
                    log_path)
     if new_hosts:
         append_log({"at": now, "event": "new_hosts",
@@ -315,6 +477,7 @@ def lines(report: dict) -> list:
         out.append("")
         out.append(f"CHANGED: {names} stopped saying nothing is available.")
         out.append("Read the page, then fill flop.json and set the spend ceilings.")
+    out += supply_lines(report.get("supply") or {}, report.get("supply_before") or {})
     for result in report["new_hosts"]:
         found = ", ".join(result["new_hosts"])
         out.append(f"\nNEW HOST on {result['label']}: {found}")
@@ -337,7 +500,8 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     report = run()
     quiet_day = not any(
-        (report["opened"], report["new_hosts"], report["new_signals"], report["reworded"])
+        (report["opened"], report["new_hosts"], report["new_signals"],
+         report["reworded"], report["supply_appeared"])
     )
     if args.quiet and quiet_day:
         return 0
