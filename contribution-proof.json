@@ -1,7 +1,7 @@
 {
   "artifact_url": "https://github.com/erkancamli/technocore-pulse",
-  "commit": "82e529382d1294017fe28e2bdc1b6868c9035c0b",
+  "commit": "f3073905ebf748a7c72a785aeb6178fcf752d09d",
   "did": "did:key:z6MkgKZSjmokZLMk3G8Edq6ra4Vpx21DV2SpRDVSs27thHyM",
   "schema": "technocore-contribution-proof-v1",
-  "signature": "SW8qjvd85c9CvuNnLsQGjfLP6TjxzEirB590yN40XdDVFwO1vTKpPFBuUNqS72N9dmQE4qE_61NOP3yR174ODg"
+  "signature": "FA06hG7dcr6y_VFp2FF4tRdk61R0G9iWKG4bGhYdHFBjNIE3CCkKxOhhyZui5_71Ejgv7rIL_sNvNzqINWtFAw"
 }
