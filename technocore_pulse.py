@@ -218,6 +218,7 @@ def measure() -> dict:
             "top_line_share": round(top_template_share(texts), 3),
             "suffix_residue": suffix_residue(texts),
             "distinct_senders": len(set(a["senders"] + b["senders"])),
+            "top_sender_share": round(top_sender_share(a["senders"] + b["senders"]), 3),
             "sampled": len(texts),
         }
         prior = previous.get("rooms", {}).get(room, {})
@@ -240,6 +241,18 @@ def top_template_share(texts: list[str]) -> float:
         return 0.0
     folded = [" ".join(t.strip().lower().split()) for t in texts]
     return Counter(folded).most_common(1)[0][1] / len(folded)
+
+
+def top_sender_share(senders: list[str]) -> float:
+    """How much of a sample the single most frequent DID accounts for.
+
+    distinct_ratio and top_line_share look at text; this looks at keys. A room
+    where one DID posts most of the lines reads very differently from one where
+    twenty DIDs post one line each, even when the distinct ratio is the same.
+    """
+    if not senders:
+        return 0.0
+    return Counter(senders).most_common(1)[0][1] / len(senders)
 
 
 def machine_tail(result: dict, budget: int = 4000) -> str:
