@@ -95,6 +95,7 @@ def config(tmp_path):
         "address": "5Fake",
         "genesis_hash": GENESIS,
         "model": "Qwen/Qwen3-8B",
+        "buy_via": "session",  # these cases exercise the direct to miner path
         "miner": "5Miner",
         "endpoint": "http://127.0.0.1:8645",
         "max_flop_per_session": "0.01",
@@ -440,3 +441,134 @@ def test_the_version_call_does_not_pass_the_network_flags():
     cli = fc.Cli(dry_run=True)
     cli.version()
     assert cli.calls[-1]["argv"] == ["flop", "--version"]
+
+
+# ------------------------------------------------- reading a failed CLI run
+
+
+REAL_FAUCET_STDERR = """{
+  "ok": false,
+  "code": "FAUCET_REQUEST_FAILED",
+  "message": "Invalid 'address'",
+  "retryable": false,
+  "next": "check `flop network status` and retry"
+}
+2026-11-03 17:00:46        RPC-CORE: subscribeRuntimeVersion(): RuntimeVersion:: disconnected from wss://rpc.devnet.flop.network: 1000:: Normal Closure
+"""
+
+
+def test_a_failed_run_reports_the_message_not_the_closing_brace():
+    """The first version printed `exited 1: }` for a real faucet failure.
+
+    On failure the CLI writes its JSON error to stderr, leaves stdout empty,
+    and appends an RPC disconnect line, so the last line of stderr is noise
+    and the line before it is a brace.
+    """
+    detail = fc.error_detail("", REAL_FAUCET_STDERR)
+    assert "FAUCET_REQUEST_FAILED" in detail
+    assert "Invalid 'address'" in detail
+    assert "retryable=False" in detail
+    assert detail.strip() != "}"
+
+
+def test_the_suggested_next_step_is_kept():
+    assert "network status" in fc.error_detail("", REAL_FAUCET_STDERR)
+
+
+def test_a_json_error_on_stdout_is_read_too():
+    detail = fc.error_detail('{"code":"X","message":"y"}', "")
+    assert "X" in detail and "y" in detail
+
+
+def test_plain_text_failure_falls_back_to_the_last_lines():
+    detail = fc.error_detail("", "something broke\nand then\nit stopped\n")
+    assert "it stopped" in detail
+
+
+def test_an_empty_failure_says_so():
+    assert fc.error_detail("", "") == "no output"
+
+
+def test_braces_alone_are_not_reported_as_the_reason():
+    assert fc.error_detail("", "{\n}\n") == "no output"
+
+
+# ------------------------------------------------------------ the chat path
+
+
+def chat_cli() -> FakeCli:
+    cli = happy()
+    cli.answers["chat hello"] = {"conversation": "c-1", "reply": "hi",
+                                 "settlement": {"channelId": "0x41b2"},
+                                 "paid": "0.002"}
+    return cli
+
+
+def test_chat_is_the_default_way_to_buy(config, tmp_path):
+    """No miner on devnet published a reachable endpoint, so chat is the path."""
+    assert fc.CONFIG_TEMPLATE["buy_via"] == "chat"
+
+
+def test_chat_needs_no_miner_or_endpoint(config, tmp_path):
+    config["buy_via"] = "chat"
+    config["miner"] = None
+    config["endpoint"] = None
+    cli = chat_cli()
+    record = fc.Client(config, cli, ledger=ledger_of(tmp_path)).buy("hello")
+    assert record["stage"] == "settled"
+    assert record["buy_via"] == "chat"
+
+
+def test_the_chat_prompt_is_positional_not_a_flag(config, tmp_path):
+    config["buy_via"] = "chat"
+    cli = chat_cli()
+    fc.Client(config, cli, ledger=ledger_of(tmp_path)).buy("hello")
+    args = cli.calls[0]["args"]
+    assert args[0] == "chat"
+    assert args[1] == "hello"
+    assert "--prompt" not in args
+    assert args[args.index("--max-flop") + 1] == "0.01"
+
+
+def test_session_mode_still_requires_a_miner_and_endpoint(config, tmp_path):
+    config["buy_via"] = "session"
+    config["endpoint"] = None
+    cli = happy()
+    with pytest.raises(fc.NotConfigured) as error:
+        fc.Client(config, cli, ledger=ledger_of(tmp_path)).buy("hello")
+    assert "endpoint" in str(error.value)
+    assert cli.calls == []
+
+
+def test_an_unknown_buy_mode_is_refused(config, tmp_path):
+    config["buy_via"] = "telepathy"
+    with pytest.raises(fc.NotConfigured):
+        fc.Client(config, happy(), ledger=ledger_of(tmp_path)).buy("hello")
+
+
+def test_the_missing_model_message_points_at_the_gateway(config, tmp_path):
+    config["model"] = None
+    with pytest.raises(fc.NotConfigured) as error:
+        fc.Client(config, happy(), ledger=ledger_of(tmp_path)).buy("hello")
+    assert "api.flop.network/v1/models" in str(error.value)
+
+
+def test_a_dry_run_does_not_move_the_running_total(config, tmp_path):
+    """A run that spent nothing must not count against the ceiling.
+
+    The first version booked the escrow on every dry run, so rehearsing a
+    session would have used up the budget for a real one.
+    """
+    config["buy_via"] = "chat"
+    cli = fc.Cli(dry_run=True)
+    record = fc.Client(config, cli, ledger=ledger_of(tmp_path)).buy("hello")
+    assert record["stage"] == "dry_run"
+    assert record["amount"] == "0"
+    assert fc.spent_so_far(ledger_of(tmp_path)) == Decimal(0)
+    assert not ledger_of(tmp_path).exists()
+
+
+def test_a_dry_run_is_not_left_looking_like_an_open_session(config, tmp_path):
+    config["buy_via"] = "chat"
+    fc.Client(config, fc.Cli(dry_run=True), ledger=ledger_of(tmp_path)).buy("hello")
+    assert fc.open_sessions() == []
