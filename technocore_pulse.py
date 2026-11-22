@@ -101,8 +101,14 @@ ROOMS = tuple(
 # was seen, which is the problem with the approach rather than with the list.
 SUFFIX_RE = re.compile(
     r"(?:\s*[·◆•†‡§※★☆]\s*[a-z0-9]{1,8}"
-    r"|\s*\[[a-z]+ #[a-z0-9-]+\])+\s*$"
+    r"|\s*\[[a-z]+ #[a-z0-9-]+\]"
+    r"|\s*\[batch-[a-z0-9]{1,8}\]"
+    r"|\s*identity:\s*batch-[a-z0-9]{1,8}\.?)+\s*$"
 )
+
+# Per-sender identifiers embedded mid-sentence; they vary without changing
+# the line, so they fold to one marker.
+IDENT_RE = re.compile(r"\bbatch-[a-z0-9]{1,8}\b")
 
 # What a suffix that the rule does not know yet looks like: some symbol this
 # sentence would not normally end on, followed by a short run of characters.
@@ -163,7 +169,8 @@ def fold(text: str) -> str:
     counts repetition goes through it, so there is one rule rather than
     several that drift.
     """
-    return " ".join(SUFFIX_RE.sub("", text.strip().lower()).split())
+    text = SUFFIX_RE.sub("", text.strip().lower())
+    return " ".join(IDENT_RE.sub("batch-#", text).split())
 
 
 def suffix_residue(texts: list[str]) -> int:
